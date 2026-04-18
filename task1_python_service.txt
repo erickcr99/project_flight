@@ -1,0 +1,190 @@
+================================================================================
+TASK 1 — Python: Flight Booking Processing Service
+================================================================================
+
+OVERVIEW
+--------
+A fully asynchronous Python service (flight_booking_service.py) that orchestrates
+the end-to-end processing of flight bookings. It reads pending records from a
+local SQLite database, validates seat availability through the MCP Server, computes
+the total fare, updates booking status via a REST API, publishes the final
+confirmation through the MCP tool, and routes any failures to a Dead Letter Queue.
+
+
+--------------------------------------------------------------------------------
+1. FETCHING BOOKINGS FROM THE DATABASE
+--------------------------------------------------------------------------------
+
+Technology: SQLAlchemy 2.x ORM + SQLite
+
+The FlightBooking ORM model maps to the "flight_bookings" table with the following
+columns: booking_id (unique), passenger_name, flight_number, seat_class, num_seats,
+origin, destination, departure_dt, base_fare, status, created_at.
+
+On startup, create_db_engine() initialises the schema (Base.metadata.create_all)
+and seeds three demo bookings (BK-001, BK-002, BK-003) if the table is empty.
+
+fetch_pending_bookings(engine) queries all rows where status = "PENDING" and
+returns a list of BookingRecord dataclasses, isolating DB concerns from the
+processing logic.
+
+
+--------------------------------------------------------------------------------
+2. VALIDATING AND PROCESSING BOOKINGS
+--------------------------------------------------------------------------------
+
+2a. Check Seat Availability — via MCP Server
+--------------------------------------------
+MCPClient.check_seat_availability() sends a JSON-RPC 2.0 POST request to
+http://localhost:8080/rpc with method "check_seat_availability" and the params:
+
+    {
+      "flight_number": "<IATA code>",
+      "seat_class":    "ECONOMY | BUSINESS | FIRST",
+      "num_seats":     <integer 1-9>,
+      "departure_dt":  "<ISO-8601 datetime>"
+    }
+
+The MCP server responds with { "available": true/false, "seats_remaining": N }.
+If available is false, the booking is immediately routed to the DLQ as FAILED.
+
+2b. Calculate Total Fare
+------------------------
+calculate_total_fare(booking) applies the following formula:
+
+    subtotal  = base_fare × seat_multiplier × num_seats + SERVICE_FEE
+    total     = round(subtotal × (1 + TAX_RATE), 2)
+
+Multipliers by class:
+    ECONOMY  → 1.00
+    BUSINESS → 1.85
+    FIRST    → 2.60
+
+Fixed constants:
+    TAX_RATE    = 0.16  (16% IVA)
+    SERVICE_FEE = $250.00 MXN
+
+Example — BK-001 (ECONOMY, 2 seats, base $3,500):
+    subtotal = 3500 × 1.00 × 2 + 250 = 7,250
+    total    = 7,250 × 1.16 = $8,410.00 MXN
+
+2c. Assign Booking Status — via REST API
+-----------------------------------------
+StatusAPIClient.assign_status() sends a PATCH request to:
+
+    http://localhost:9090/api/bookings/{booking_id}/status
+
+Request body (JSON):
+    {
+      "status":     "CONFIRMED",
+      "total_fare": <float>,
+      "updated_at": "<ISO-8601 datetime>"
+    }
+
+The mock REST API logs the update in memory and returns { "ok": true }.
+
+
+--------------------------------------------------------------------------------
+3. PUBLISHING BOOKING CONFIRMATION VIA MCP TOOL
+--------------------------------------------------------------------------------
+
+After the REST status update succeeds, MCPClient.process_booking() calls the
+MCP Server with method "process_booking", passing the full ProcessedBooking
+dataclass serialised to a dict (via dataclasses.asdict).
+
+The MCP server validates seats again, applies business rules, reserves the seats
+in its inventory, and returns a structured confirmation:
+
+    {
+      "booking_id":        "BK-001",
+      "confirmation_code": "CONF-XXXXXXXX",
+      "status":            "CONFIRMED",
+      "total_fare":        8410.00,
+      "processed_at":      "2026-..."
+    }
+
+The confirmation_code is stored on the ProcessedBooking and written back to SQLite
+with status = CONFIRMED via update_booking_status(engine, booking_id, status).
+
+
+--------------------------------------------------------------------------------
+4. SENDING FAILURES TO DLQ
+--------------------------------------------------------------------------------
+
+LocalDLQ simulates AWS SQS by appending failure messages to dlq_messages.json.
+
+When any step in the pipeline raises an exception (seat unavailable, network
+error, validation failure, etc.), the except block in FlightBookingProcessor.process()
+calls:
+
+    self.dlq.send(booking_id, error_message, asdict(processed_booking))
+
+Each DLQ message contains:
+    {
+      "booking_id": "BK-002",
+      "error":      "<error description>",
+      "payload":    { <full ProcessedBooking snapshot> },
+      "failed_at":  "<ISO-8601 datetime>"
+    }
+
+The booking status is also updated to FAILED in SQLite for traceability.
+
+In a production environment, LocalDLQ.send() would be replaced with a call to
+boto3.client("sqs").send_message() targeting an AWS SQS dead-letter queue.
+
+
+--------------------------------------------------------------------------------
+5. CONCURRENCY AND RESILIENCE
+--------------------------------------------------------------------------------
+
+All processing is async (asyncio + aiohttp). Bookings are processed in parallel
+using asyncio.gather(), bounded by asyncio.Semaphore(5) to prevent overwhelming
+downstream services.
+
+Each booking is independent: one failure does not block the others.
+HTTP timeouts are set to 10 seconds on all outbound calls.
+A shared aiohttp.ClientSession is reused across all requests for connection pooling.
+
+
+--------------------------------------------------------------------------------
+6. CONFIGURATION
+--------------------------------------------------------------------------------
+
+All service URLs and the database path are read from environment variables
+(with .env support via python-dotenv):
+
+    MCP_SERVER_URL = http://localhost:8080   (default)
+    STATUS_API_URL = http://localhost:9090/api/bookings   (default)
+    DATABASE_URL   = sqlite:///./flight_bookings.db   (default)
+
+
+--------------------------------------------------------------------------------
+7. HOW TO RUN
+--------------------------------------------------------------------------------
+
+Prerequisites (install once):
+    pip install -r requirements.txt
+
+Start dependencies:
+    uvicorn mcp_server:app --port 8080       # Terminal 1
+    uvicorn mock_status_api:app --port 9090  # Terminal 2
+
+Run the service:
+    python flight_booking_service.py
+
+Optional — launch the Streamlit UI:
+    streamlit run ui.py
+
+
+--------------------------------------------------------------------------------
+8. KEY FILES
+--------------------------------------------------------------------------------
+
+    flight_booking_service.py   Main processing service
+    mock_status_api.py          Local mock of the external REST status API
+    flight_bookings.db          SQLite database (auto-created on first run)
+    dlq_messages.json           Local DLQ output file (created on first failure)
+    .env                        Environment variable overrides
+    requirements.txt            Python dependencies
+
+================================================================================

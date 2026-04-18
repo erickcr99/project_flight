@@ -1,0 +1,5 @@
+.env
+*.db
+__pycache__/
+*.pyc
+dlq_messages.json

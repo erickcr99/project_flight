@@ -1,0 +1,259 @@
+================================================================================
+TASK 2 — MCP Server: Flight Booking Operations
+================================================================================
+
+OVERVIEW
+--------
+A FastAPI-based Model Context Protocol (MCP) server (mcp_server.py) that exposes
+flight booking operations as JSON-RPC 2.0 tools. It handles seat validation,
+fare calculation, booking confirmation, and cancellation — all returning structured
+JSON responses. The server runs on http://localhost:8080 and includes interactive
+documentation at http://localhost:8080/docs.
+
+
+--------------------------------------------------------------------------------
+1. EXPOSED TOOLS
+--------------------------------------------------------------------------------
+
+The server exposes three tools discoverable via GET /tools:
+
+    process_booking         Validates seats, calculates fare, confirms booking
+    cancel_booking          Cancels an existing confirmed booking
+    check_seat_availability Verifies seat availability without reserving
+
+Tool definitions follow the MCP schema convention:
+
+    {
+      "name":        "<tool_name>",
+      "description": "<human-readable description>",
+      "inputSchema": {
+        "type":       "object",
+        "required":   [ ... ],
+        "properties": { ... }
+      }
+    }
+
+GET /tools returns the full list along with a tool_count, server name, and
+current UTC timestamp.
+
+
+--------------------------------------------------------------------------------
+2. JSON-RPC 2.0 REQUEST FORMAT
+--------------------------------------------------------------------------------
+
+All tool invocations go through POST /rpc using the JSON-RPC 2.0 protocol.
+
+Request structure:
+    {
+      "jsonrpc": "2.0",
+      "id":      "<string or integer>",
+      "method":  "<tool_name>",
+      "params":  { <tool-specific parameters> }
+    }
+
+The request is validated with the JsonRpcRequest Pydantic model, which enforces:
+    - jsonrpc must be the literal string "2.0"
+    - id is required (string or integer)
+    - method is required
+    - params defaults to an empty object if omitted
+
+
+--------------------------------------------------------------------------------
+3. TOOL INPUT SCHEMAS AND VALIDATION
+--------------------------------------------------------------------------------
+
+Each tool has a dedicated Pydantic model that validates params before execution:
+
+process_booking (ProcessBookingInput):
+    booking_id      str     required, min 1 char
+    passenger_name  str     required, min 1 char
+    flight_number   str     required, min 2 chars
+    seat_class      str     required, enum: ECONOMY | BUSINESS | FIRST
+    num_seats       int     required, 1–9
+    origin          str     required, exactly 3 chars (IATA)
+    destination     str     required, exactly 3 chars (IATA)
+    departure_dt    str     required, must be valid ISO-8601 (validated by field_validator)
+    base_fare       float   required, > 0
+    total_fare      float   required, > 0
+    status          str     required
+
+cancel_booking (CancelBookingInput):
+    booking_id      str     required, min 1 char
+    reason          str     required, 1–500 chars
+
+check_seat_availability (SeatAvailabilityInput):
+    flight_number   str     required, 2–10 chars
+    seat_class      str     required, enum: ECONOMY | BUSINESS | FIRST
+    num_seats       int     required, 1–9
+    departure_dt    str     required (ISO-8601 datetime)
+
+
+--------------------------------------------------------------------------------
+4. BUSINESS LOGIC
+--------------------------------------------------------------------------------
+
+4a. process_booking
+-------------------
+1. Validate seat availability using the in-memory FLIGHT_INVENTORY store.
+   If seats_remaining < num_seats → return error SEAT_UNAVAILABLE (-32000).
+2. Validate that total_fare >= base_fare.
+   If not → return error INVALID_PARAMS (-32602).
+3. Reserve seats: decrement FLIGHT_INVENTORY[flight][class] by num_seats.
+4. Generate a unique confirmation code: "CONF-" + 8 random alphanumeric chars.
+5. Store the full booking record in BOOKINGS_STORE (in-memory dict keyed by booking_id).
+6. Return the complete booking record including confirmation_code and processed_at.
+
+Flight inventory (in-memory, resets on restart):
+    MX204: ECONOMY=120, BUSINESS=20, FIRST=8
+    AA100: ECONOMY=150, BUSINESS=30, FIRST=12
+    UA550: ECONOMY=100, BUSINESS=25, FIRST=6
+
+Unknown flights default to 50 seats per class.
+
+4b. cancel_booking
+------------------
+1. Look up the booking in BOOKINGS_STORE (in-memory).
+2. If not found in memory, fall back to querying flight_bookings.db directly
+   via sqlite3 (handles server restarts and bookings not yet processed in the
+   current session).
+3. If still not found → return error BOOKING_NOT_FOUND (-32001).
+4. If already CANCELLED → return error ALREADY_CANCELLED (-32002).
+5. Release seats back into FLIGHT_INVENTORY.
+6. Mark the record as CANCELLED with cancel_reason and cancelled_at timestamp.
+7. Persist the CANCELLED status to SQLite via UPDATE flight_bookings SET status.
+8. Return: booking_id, cancelled=true, cancel_reason, cancelled_at, seats_released.
+
+4c. check_seat_availability
+----------------------------
+Reads the current seat count from FLIGHT_INVENTORY without modifying it.
+Returns: available (bool), seats_requested, seats_remaining, flight_number,
+         seat_class, checked_at.
+
+
+--------------------------------------------------------------------------------
+5. RESPONSE STRUCTURES
+--------------------------------------------------------------------------------
+
+All responses follow the JSON-RPC 2.0 envelope:
+
+Success:
+    {
+      "jsonrpc": "2.0",
+      "id":      "<request id>",
+      "result":  { <tool-specific result object> },
+      "error":   null
+    }
+
+Error:
+    {
+      "jsonrpc": "2.0",
+      "id":      "<request id or null>",
+      "result":  null,
+      "error": {
+        "code":    <integer>,
+        "message": "<description>",
+        "data":    <optional additional info>
+      }
+    }
+
+Standard JSON-RPC error codes:
+    -32700   Parse error         Malformed JSON body
+    -32600   Invalid request     Missing or wrong JSON-RPC fields
+    -32601   Method not found    Unknown tool name
+    -32602   Invalid params      Pydantic validation failure
+    -32603   Internal error      Unhandled server exception
+
+Application-specific error codes:
+    -32000   Seat unavailable    Not enough seats on the requested flight/class
+    -32001   Booking not found   No record matching the given booking_id
+    -32002   Already cancelled   The booking has already been cancelled
+
+
+--------------------------------------------------------------------------------
+6. TOOL DISCOVERY ENDPOINT
+--------------------------------------------------------------------------------
+
+GET /tools
+
+Returns the MCP tool manifest so any client (AI agent, service, dashboard)
+can introspect available operations without hardcoding them.
+
+Response example:
+    {
+      "tools": [
+        {
+          "name": "process_booking",
+          "description": "Valida asientos, calcula tarifa y confirma la reserva.",
+          "inputSchema": { ... }
+        },
+        { "name": "cancel_booking",  ... },
+        { "name": "check_seat_availability", ... }
+      ],
+      "tool_count": 3,
+      "server":     "MCP Flight Booking Server v1.0.0",
+      "timestamp":  "2026-..."
+    }
+
+
+--------------------------------------------------------------------------------
+7. ADDITIONAL ENDPOINTS
+--------------------------------------------------------------------------------
+
+GET /health
+    Returns { "status": "ok", "timestamp": "<UTC ISO-8601>" }
+    Used by the Streamlit UI sidebar to display live service status.
+
+GET /docs  (Swagger UI — auto-generated by FastAPI)
+    Interactive browser-based documentation for all endpoints.
+    The /rpc endpoint exposes the full JsonRpcRequest schema, allowing direct
+    testing from the browser without a separate client.
+
+
+--------------------------------------------------------------------------------
+8. ARCHITECTURE NOTES
+--------------------------------------------------------------------------------
+
+- Framework: FastAPI 0.115 + Uvicorn
+- Validation: Pydantic v2 (BaseModel, Field, field_validator)
+- Protocol: JSON-RPC 2.0 over HTTP POST
+- State: in-memory BOOKINGS_STORE and FLIGHT_INVENTORY (per process lifetime)
+  with SQLite fallback for cancel_booking to survive server restarts
+- Logging: structured timestamped logs for every RPC call (in/out, errors)
+- No external dependencies beyond FastAPI and Pydantic
+
+
+--------------------------------------------------------------------------------
+9. HOW TO RUN
+--------------------------------------------------------------------------------
+
+    pip install -r requirements.txt
+    uvicorn mcp_server:app --port 8080 --reload
+
+Interactive docs:   http://localhost:8080/docs
+Tool manifest:      http://localhost:8080/tools
+Health check:       http://localhost:8080/health
+
+Example curl call:
+    curl -X POST http://localhost:8080/rpc \
+         -H "Content-Type: application/json" \
+         -d '{
+               "jsonrpc": "2.0",
+               "id": "1",
+               "method": "check_seat_availability",
+               "params": {
+                 "flight_number": "MX204",
+                 "seat_class":    "ECONOMY",
+                 "num_seats":     2,
+                 "departure_dt":  "2026-05-01T10:00:00"
+               }
+             }'
+
+
+--------------------------------------------------------------------------------
+10. KEY FILES
+--------------------------------------------------------------------------------
+
+    mcp_server.py    MCP Server implementation (this task)
+    requirements.txt Python dependencies
+
+================================================================================
